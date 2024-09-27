@@ -1,3 +1,1722 @@
-Ram is a good boy.
-Rina is a good girl.
-Ravan is a bad boy.
+package transformations.costaccounting
+
+import org.apache.spark.sql.types._
+import org.apache.spark.sql.functions._
+import transformations.utils.CommonUtils._
+import org.apache.spark.sql.{Dataset, Encoder, Row, SparkSession}
+import play.api.libs.json.{JsValue, Json}
+
+import scala.math.BigDecimal
+import org.apache.spark.sql.expressions.UserDefinedFunction
+import org.apache.spark.sql.functions.udf
+import org.slf4j.{Logger, LoggerFactory}
+
+import scala.io.Source
+
+object CostAccountingAllocationTransformation {
+
+  def main(args: Array[String]): Unit = {
+    val params: Map[String, String] = commandLineToMap(args)
+    val LOG: Logger = LoggerFactory.getLogger(getClass.getName)
+
+    val schemaName = params.getOrElse("schema_name", "DIUSER")
+    val stagingBucket =
+      params.getOrElse("staging_bucket", "etl_avro_files@idlcbf4ihtx7")
+    val uuidValue = params.getOrElse("UUID_value", "DEFAULT_UUID")
+    val fileFormat = params.getOrElse("staging_file_format", "parquet")
+    val outputPathPrefix = params.getOrElse(
+      "output",
+      "/Users/db040509/Downloads/"
+      //s"oci://$stagingBucket/$uuidValue/$schemaName/"
+    )
+    val costallocationrecordPath = params.getOrElse(
+      "costallocationrecord",
+      //"oci://cerner-healtheintent-us-dev-1-zone10-programprocessing@idlcbf4ihtx7/popHealth/populations/ea00b9e6-465c-41d5-b8a4-f34c5f0ee50d/programs/outputs/versions/2024/03/18/1746/populationRecordEntities/costaccountingprocessing/*"
+      "/Users/db040509/Desktop/perioddata.json"
+      //"/Users/db040509/Downloads/charge.avro"
+    )
+
+    val populationId = params.getOrElse("populationId", "fake_population_id")
+
+    val local = !outputPathPrefix.substring(0, 6).equals("oci://")
+    val spark = if (local) {
+      SparkSession.builder
+        .appName("CostAccountingAllocationTransformation")
+        .master("local")
+        .getOrCreate()
+    } else {
+      SparkSession.builder
+        .appName("CostAccountingAllocationTransformation")
+        .getOrCreate()
+    }
+
+    import spark.implicits._
+
+    spark.conf.set("spark.sql.avro.datetimeRebaseModeInWrite", "LEGACY")
+    spark.conf.set("spark.sql.legacy.timeParserPolicy", "LEGACY")
+
+    val sc = spark.sparkContext
+    val totalCores = sc.getConf.getInt(
+      "spark.executor.instances",
+      1
+    ) * sc.getConf.getInt("spark.executor.cores", 1)
+    var coalesceValue = 2 * totalCores
+    val costAllocationDummyRecordPath = params.getOrElse(
+      "cost_allocation_dummy_record_path",
+      "/dummy/cost_allocation.dummy.json"
+    )
+
+    val schema =
+      readJsonDummyRecord(spark, costAllocationDummyRecordPath).schema
+
+    val source = Source.fromFile(costallocationrecordPath)
+    val jsonObject: JsValue =
+      try {
+        // Read the file content and directly parse it into a JSON object
+        Json.parse(source.mkString)
+      } finally {
+        source.close()
+      }
+
+    // Convert the JSON object back to a string (similar to JSON.stringify in JavaScript)
+    val costDistributionInputJsonString: String = Json.stringify(jsonObject)
+    // print(costDistributionInputJsonString)
+    val costallocationrecordDf = spark.read
+      .format("json")
+      .schema(schema)
+      .json(Seq(costDistributionInputJsonString).toDS())
+      .cache()
+
+    coalesceValue =
+      Math.max(coalesceValue, costallocationrecordDf.count / 1000000).toInt
+    costallocationrecordDf.show()
+
+    val periodicAccountDataDf =
+      extractPeriodicAccountDataDf(spark, costallocationrecordDf)
+
+    periodicAccountDataDf.show()
+
+    val costComponentsDf = extractCostComponentDf(spark, costallocationrecordDf)
+
+    costComponentsDf.show()
+
+    val centerOrdersDf = extractCenterOrdersDf(spark, costallocationrecordDf)
+
+    centerOrdersDf.show()
+
+    val transferDf = extractTransfersDf(spark, costallocationrecordDf)
+
+    transferDf.show()
+
+    val statisticAssignmentDf =
+      extractStatisticAssignmentDf(spark, costallocationrecordDf)
+    statisticAssignmentDf.show(false)
+
+    val centerSplitResultDf = splitCostPerPeriod(
+      spark,
+      LOG,
+      periodicAccountDataDf,
+      costComponentsDf,
+      centerOrdersDf
+    )
+
+    centerSplitResultDf.show()
+  }
+
+  private def extractPeriodicAccountDataDf(
+      spark: SparkSession,
+      inputDf: Dataset[Row]
+  ): Dataset[Row] = {
+
+    import spark.implicits._
+
+    val accountDataSetModelDf = inputDf
+      .withColumn("flattened_accountDataSets", explode($"accountDataSets"))
+      .drop($"accountDataSets")
+      .withColumn(
+        "periodicData",
+        map((1 to 12).flatMap { i =>
+          Seq(lit(i.toString), col(s"flattened_accountDataSets.period$i"))
+        }: _*)
+      )
+      .select(
+        $"flattened_accountDataSets.id",
+        $"flattened_accountDataSets.centerExternalId".alias("centerId"),
+        $"flattened_accountDataSets.accountExternalId".alias("accountId"),
+        upper($"flattened_accountDataSets.accountType").alias("accountType"),
+        $"periodicData"
+      )
+    validatePeriodicAccountDataDf(accountDataSetModelDf)
+
+    // Explode the periodicData map into key-value pairs and create the new fields
+    val accountDataSetDf = accountDataSetModelDf
+      .withColumn("periodicData", explode(expr("map_entries(periodicData)")))
+      .select(
+        $"centerId",
+        $"accountId",
+        $"accountType",
+        col("periodicData.key")
+          .cast("int")
+          .alias("period"), // Extract key as "period" and convert to Int
+        col("periodicData.value")
+          .cast("double")
+          .alias("cost") // Extract value as "Cost"
+      )
+
+    accountDataSetDf
+  }
+
+  private def extractCostComponentDf(
+      spark: SparkSession,
+      inputDf: Dataset[Row]
+  ): Dataset[Row] = {
+    import spark.implicits._
+
+    val costComponentModelDf = inputDf
+      .withColumn("flattened_costComponents", explode($"costComponents"))
+      .drop($"costComponents")
+      .withColumn(
+        "isUsePercent",
+        not(
+          $"flattened_costComponents.monthlyDataType".isNull.or(
+            $"flattened_costComponents.monthlyDataType" === lit("currency")
+          )
+        )
+      )
+      .withColumn(
+        "percentageAmountByPeriod",
+        map((1 to 12).flatMap { i =>
+          Seq(lit(i.toString), col(s"flattened_costComponents.period$i"))
+        }: _*)
+      )
+      .select(
+        $"flattened_costComponents.accountExternalId".alias("accountId"),
+        $"flattened_costComponents.centerExternalId".alias("centerId"),
+        $"flattened_costComponents.expenseAccountGroupExternalId"
+          .alias("expenseAccountGroupId"),
+        $"flattened_costComponents.fixedPercent"
+          .cast("double")
+          .alias("fixedPercent"),
+        $"flattened_costComponents.fixedBaseAmount"
+          .cast("double")
+          .alias("fixedBaseAmount"),
+        $"flattened_costComponents.useMonthlyData"
+          .cast("boolean")
+          .alias("usePeriodicData"),
+        $"isUsePercent".cast("boolean").alias("isUsePercent"),
+        $"flattened_costComponents.monthlyDataType",
+        $"percentageAmountByPeriod"
+      )
+
+    validateCostComponentModelDf(costComponentModelDf)
+
+    // Assuming `costComponentModelDf` is your input DataFrame
+    val periodicPercentageAmountSchema = StructType(
+      Seq(
+        StructField("period", IntegerType, true),
+        StructField("amount", DoubleType, true),
+        StructField("percentage", DoubleType, true)
+      )
+    )
+
+    // Flatten the input DataFrame based on the percentageAmountByPeriod map
+    val flattenedDf = costComponentModelDf
+      .flatMap(row => {
+        val accountId = row.getAs[String]("accountId")
+        val centerId = row.getAs[String]("centerId")
+        val expenseAccountGroupId = row.getAs[String]("expenseAccountGroupId")
+        val fixedBaseAmount = row.getAs[Double]("fixedBaseAmount")
+        val fixedPercent = row.getAs[Double]("fixedPercent")
+        val usePeriodicData = row.getAs[Boolean]("usePeriodicData")
+        val isUsePercent = row.getAs[Boolean]("isUsePercent")
+
+        // Get the map of periods and percentages (amounts)
+        val percentageAmountByPeriod =
+          row.getAs[Map[String, String]]("percentageAmountByPeriod")
+
+        if (
+          percentageAmountByPeriod == null || percentageAmountByPeriod.isEmpty
+        ) {
+          Seq.empty[
+            (
+                String,
+                String,
+                String,
+                Double,
+                Double,
+                Boolean,
+                Boolean,
+                Int,
+                Double,
+                Double
+            )
+          ]
+        } else {
+          // Convert the map to the correct data structure
+          val convertedMap =
+            percentageAmountByPeriod.map { case (periodStr, valueStr) =>
+              val period = periodStr.toInt
+              val value = BigDecimal(valueStr)
+
+              // Build a tuple of the required fields
+              if (isUsePercent) {
+                (
+                  accountId,
+                  centerId,
+                  expenseAccountGroupId,
+                  fixedBaseAmount,
+                  fixedPercent,
+                  usePeriodicData,
+                  isUsePercent,
+                  period,
+                  0.0,
+                  value.toDouble
+                )
+              } else {
+                (
+                  accountId,
+                  centerId,
+                  expenseAccountGroupId,
+                  fixedBaseAmount,
+                  fixedPercent,
+                  usePeriodicData,
+                  isUsePercent,
+                  period,
+                  value.toDouble,
+                  0.0
+                )
+              }
+            }.toSeq
+
+          convertedMap
+        }
+      })
+      .toDF(
+        "accountId",
+        "centerId",
+        "expenseAccountGroupId",
+        "fixedBaseAmount",
+        "fixedPercent",
+        "usePeriodicData",
+        "isUsePercent",
+        "period",
+        "amount",
+        "percentage"
+      )
+
+    // Now cast the struct field using the schema
+    val costComponentDf = flattenedDf
+      .withColumn(
+        "periodicPercentageAmount",
+        struct($"period", $"amount", $"percentage")
+          .cast(periodicPercentageAmountSchema)
+      )
+      .select(
+        $"accountId",
+        $"centerId",
+        $"expenseAccountGroupId",
+        $"fixedBaseAmount",
+        $"fixedPercent",
+        $"usePeriodicData",
+        $"isUsePercent",
+        $"periodicPercentageAmount"
+      )
+
+    costComponentDf
+  }
+
+  private def extractCenterOrdersDf(
+      spark: SparkSession,
+      inputDf: Dataset[Row]
+  ): Dataset[Row] = {
+    import spark.implicits._
+    val centerOrderModelDf = inputDf
+      .withColumn("flattened_centerOrders", explode($"centerOrders"))
+      .select(
+        $"flattened_centerOrders.centerExternalId".alias("centerId"),
+        $"flattened_centerOrders.sequenceNumber"
+          .cast("int")
+          .alias("sequenceNumber"),
+        upper($"flattened_centerOrders.centerType").alias("centerType")
+      )
+    validateCenterOrderModelDf(centerOrderModelDf)
+
+    val centerOrderDf = centerOrderModelDf.select(
+      $"centerId",
+      $"centerType",
+      $"sequenceNumber"
+    )
+
+    centerOrderDf
+
+  }
+
+  private def extractTransfersDf(
+      spark: SparkSession,
+      inputDf: Dataset[Row]
+  ): Dataset[Row] = {
+    import spark.implicits._
+
+    val transfersModelDf = inputDf
+      .withColumn("flattened_transfers", explode($"transfers"))
+      .drop($"transfers")
+      .withColumn(
+        "isUsePercent",
+        not(
+          $"flattened_transfers.amountType".isNull.or(
+            lower($"flattened_transfers.amountType") === lit("currency")
+          )
+        )
+      )
+      .withColumn(
+        "percentageAmountByPeriod",
+        map((1 to 12).flatMap { i =>
+          Seq(lit(i.toString), col(s"flattened_transfers.period$i"))
+        }: _*)
+      )
+      .select(
+        $"flattened_transfers.id",
+        $"flattened_transfers.sequenceNumber"
+          .cast("int")
+          .alias("sequenceOrder"),
+        upper($"flattened_transfers.costType").alias("costType"),
+        $"flattened_transfers.amountType",
+        upper($"flattened_transfers.transferLevel").alias("transferLevel"),
+        upper($"flattened_transfers.transferType").alias("transferType"),
+        $"flattened_transfers.srcCenterExternalId".alias("sourceCenterId"),
+        $"flattened_transfers.srcAccountExternalId".alias("sourceAccountId"),
+        $"flattened_transfers.destCenterExternalId"
+          .alias("destinationCenterId"),
+        $"flattened_transfers.destAccountExternalId"
+          .alias("destinationAccountId"),
+        $"isUsePercent".cast("boolean").alias("isUsePercent"),
+        $"percentageAmountByPeriod"
+      )
+
+    validateTransfersModelDf(transfersModelDf)
+
+    // Define the schema for periodicPercentageAmount struct
+    val periodicPercentageAmountSchema = StructType(
+      Seq(
+        StructField("period", IntegerType, true),
+        StructField("amount", DoubleType, true),
+        StructField("percentage", DoubleType, true)
+      )
+    )
+
+    // Process the input transferModelDf
+    val transferDf = transfersModelDf
+      .flatMap(row => {
+        val destinationAccountId = row.getAs[String]("destinationAccountId")
+        val destinationCenterId = row.getAs[String]("destinationCenterId")
+        val sequenceOrder = row.getAs[Int]("sequenceOrder")
+        val sourceAccountId = row.getAs[String]("sourceAccountId")
+        val sourceCenterId = row.getAs[String]("sourceCenterId")
+        val transferLevel = row.getAs[String]("transferLevel")
+        val transferType = row.getAs[String]("transferType")
+        val costType = row.getAs[String]("costType")
+        val isUsePercent = row.getAs[Boolean]("isUsePercent")
+        val percentageAmountByPeriod =
+          row.getAs[Map[String, String]]("percentageAmountByPeriod")
+
+        // Logic for handling CostType.FIXED_VARIABLE
+        val transfers = if (costType.equalsIgnoreCase("FIXED_VARIABLE")) {
+          Seq(
+            (
+              destinationAccountId,
+              destinationCenterId,
+              sequenceOrder,
+              sourceAccountId,
+              sourceCenterId,
+              transferLevel,
+              transferType,
+              "FIXED",
+              isUsePercent,
+              buildPeriodicPercentageAmountByPeriod(
+                percentageAmountByPeriod,
+                isUsePercent
+              )
+            ),
+            (
+              destinationAccountId,
+              destinationCenterId,
+              sequenceOrder,
+              sourceAccountId,
+              sourceCenterId,
+              transferLevel,
+              transferType,
+              "VARIABLE",
+              isUsePercent,
+              buildPeriodicPercentageAmountByPeriod(
+                percentageAmountByPeriod,
+                isUsePercent
+              )
+            )
+          )
+        } else {
+          Seq(
+            (
+              destinationAccountId,
+              destinationCenterId,
+              sequenceOrder,
+              sourceAccountId,
+              sourceCenterId,
+              transferLevel,
+              transferType,
+              costType,
+              isUsePercent,
+              buildPeriodicPercentageAmountByPeriod(
+                percentageAmountByPeriod,
+                isUsePercent
+              )
+            )
+          )
+        }
+
+        // Flatten the periodicPercentageAmount data
+        transfers.flatMap {
+          case (
+                destAccId,
+                destCentId,
+                seqOrder,
+                srcAccId,
+                srcCentId,
+                transLevel,
+                transType,
+                cType,
+                isPercent,
+                periodicAmounts
+              ) =>
+            periodicAmounts.map { case (period, amount, percentage) =>
+              (
+                destAccId,
+                destCentId,
+                seqOrder,
+                srcAccId,
+                srcCentId,
+                transLevel,
+                transType,
+                cType,
+                isPercent,
+                period,
+                amount,
+                percentage
+              )
+            }
+        }
+      })
+      .toDF(
+        "destinationAccountId",
+        "destinationCenterId",
+        "sequenceOrder",
+        "sourceAccountId",
+        "sourceCenterId",
+        "transferLevel",
+        "transferType",
+        "costType",
+        "isUsePercent",
+        "period",
+        "amount",
+        "percentage"
+      )
+      // Cast the flattened periodicPercentageAmount fields to the periodicPercentageAmount struct
+      .withColumn(
+        "periodicPercentageAmount",
+        struct($"period", $"amount", $"percentage")
+          .cast(periodicPercentageAmountSchema)
+      )
+      .select(
+        $"DestinationAccountId",
+        $"DestinationCenterId",
+        $"SequenceOrder",
+        $"SourceAccountId",
+        $"SourceCenterId",
+        $"TransferLevel",
+        $"TransferType",
+        $"CostType",
+        $"isUsePercent",
+        $"periodicPercentageAmount"
+      )
+
+    transferDf
+  }
+
+  private def extractStatisticAssignmentDf(
+      spark: SparkSession,
+      inputDf: Dataset[Row]
+  ): Dataset[Row] = {
+    import spark.implicits._
+
+    val statisticAssignmentModelDf = inputDf
+      .withColumn(
+        "flattened_statisticAssignments",
+        explode($"statisticAssignments")
+      )
+      .drop($"statisticAssignments")
+      .select(
+        $"flattened_statisticAssignments.id",
+        $"flattened_statisticAssignments.clientId",
+        $"flattened_statisticAssignments.costModelId",
+        $"flattened_statisticAssignments.centerExternalId"
+          .alias("overheadCenterId"),
+        $"flattened_statisticAssignments.expenseAccountGroupExternalId"
+          .alias("accountGroupId"),
+        $"flattened_statisticAssignments.fixedStatisticName",
+        $"flattened_statisticAssignments.variableStatisticName",
+        $"flattened_statisticAssignments.createdAt",
+        $"flattened_statisticAssignments.updatedAt"
+      )
+
+    val statisticModelDf = inputDf
+      .withColumn(
+        "flattened_statistics",
+        explode($"statistics")
+      )
+      .withColumn(
+        "statisticValueByPeriod",
+        map((1 to 12).flatMap { i =>
+          Seq(lit(i.toString), col(s"flattened_statistics.period$i"))
+        }: _*)
+      )
+      .drop($"statistics")
+      .select(
+        $"flattened_statistics.id",
+        $"flattened_statistics.statisticName",
+        $"flattened_statistics.centerExternalId"
+          .alias("centerId"),
+        $"statisticValueByPeriod"
+      )
+
+    validateStatisticModelDf(statisticModelDf)
+
+    // Group and aggregate to get fixed and variable statistic names
+    val statisticAssignmentModel_intermediateDf = statisticAssignmentModelDf
+      .groupBy($"accountGroupId", $"overheadCenterId")
+      .agg(
+        collect_set($"fixedStatisticName").as("fixedStatisticNames"),
+        collect_set($"variableStatisticName").as("variableStatisticNames")
+      )
+
+    // Explode the sets to have one row per fixed and variable statistic name for proper join
+    val explodedStatisticAssignmentsDf = statisticAssignmentModel_intermediateDf
+      .withColumn("fixedStatisticName", explode($"fixedStatisticNames"))
+      .withColumn("variableStatisticName", explode($"variableStatisticNames"))
+      .drop("fixedStatisticNames", "variableStatisticNames")
+
+    // Filter the statisticModelDf based on the condition you described
+    val filteredFixedCostStatisticsDf = statisticModelDf
+      .join(
+        explodedStatisticAssignmentsDf,
+        ($"statisticName" === $"fixedStatisticName") &&
+          $"centerId" =!= $"overheadCenterId"
+      )
+      .select(
+        $"accountGroupId",
+        $"overheadCenterId",
+        $"statisticName".alias("statisticId"),
+        $"statisticName",
+        $"centerId",
+        // Convert statisticValueByPeriod (MapType) to ArrayType for set operations
+        map_entries($"statisticValueByPeriod")
+          .alias("statisticValueByPeriodArray"),
+        lit("FIXED").alias("costType")
+      )
+
+    val filteredVariableCostStatisticsDf = statisticModelDf
+      .join(
+        explodedStatisticAssignmentsDf,
+        ($"statisticName" === $"variableStatisticName") &&
+          $"centerId" =!= $"overheadCenterId"
+      )
+      .select(
+        $"accountGroupId",
+        $"overheadCenterId",
+        $"statisticName".alias("statisticId"),
+        $"statisticName",
+        $"centerId",
+        // Convert statisticValueByPeriod (MapType) to ArrayType for set operations
+        map_entries($"statisticValueByPeriod")
+          .alias("statisticValueByPeriodArray"),
+        lit("VARIABLE").alias("costType")
+      )
+
+    // Perform union and deduplication with the ArrayType
+    val filteredStatisticsDf = filteredFixedCostStatisticsDf
+      .union(filteredVariableCostStatisticsDf)
+      .distinct()
+
+    // Convert the ArrayType back to MapType
+    val finalStatisticsDf = filteredStatisticsDf
+      .withColumn(
+        "statisticValueByPeriod",
+        map_from_entries($"statisticValueByPeriodArray")
+      )
+      .drop("statisticValueByPeriodArray")
+
+    // Now, group by accountGroupId, overheadCenterId, and costType to collect statistics as required
+    val groupedStatisticsDf = finalStatisticsDf
+      .groupBy($"accountGroupId", $"overheadCenterId", $"costType")
+      .agg(
+        collect_list(
+          struct(
+            $"statisticId",
+            $"statisticName",
+            $"centerId",
+            $"statisticValueByPeriod"
+          )
+        ).as("statistics")
+      )
+    groupedStatisticsDf.printSchema()
+    groupedStatisticsDf
+
+//    // Group by AccountGroupId and OverheadCenterId, and collect the rest of the columns into a set of tuples
+//    val statisticAssignmentModel_intermediateDf = statisticAssignmentModelDf
+//      .groupBy($"accountGroupId", $"overheadCenterId")
+//      .agg(
+//        collect_set(
+//          struct(
+//            $"overheadCenterId",
+//            $"fixedStatisticName",
+//            $"variableStatisticName"
+//          )
+//        ).as("setOfStatisticAssignmentModel")
+//      )
+//      .select(
+//        $"overheadCenterId",
+//        $"accountGroupId",
+//        $"setOfStatisticAssignmentModel"
+//      ) // Select only Key and Set_of_StatisticAssignmentModel
+//    statisticAssignmentModel_intermediateDf.printSchema()
+//
+//    // Convert statisticModelDf into a Map in advance
+//    val statisticModelMap: Map[(String, String), Map[Int, Double]] =
+//      statisticModelDf
+//        .collect()
+//        .map(row => {
+//          //val statisticId = row.getAs[String]("statisticName")
+//          val statisticName = row.getAs[String]("statisticName")
+//          val centerId = row.getAs[String]("centerId")
+//
+//          // Assuming statisticValueByPeriod is a Map[String, String]
+//          val statisticValueByPeriod =
+//            row.getAs[Map[String, String]]("statisticValueByPeriod")
+//
+//          // Convert the Map[String, String] to Map[Int, Double]
+//          val periodValueMap = statisticValueByPeriod.flatMap {
+//            case (periodStr, valueStr) if periodStr.forall(_.isDigit) =>
+//              val period = periodStr.toInt
+//              val value = BigDecimal(valueStr).toDouble
+//              Some(period -> value)
+//            case _ => None
+//          }.toMap
+//
+//          ((statisticName, centerId), periodValueMap)
+//        })
+//        .toMap
+//
+//    // Modified flatMap operation
+//    val statisticsAssignmentDf = statisticAssignmentModel_intermediateDf
+//      .flatMap(row => {
+//        // Extract key and other necessary fields
+//        val accountGroupId = row.getAs[String]("accountGroupId")
+//        val overheadCenterId = row.getAs[String]("overheadCenterId")
+//        val setOfStatisticAssignmentModels =
+//          row.getSeq[Row](row.fieldIndex("setOfStatisticAssignmentModel"))
+//
+//        // Extract fixed and variable statistic names from the current row
+//        val fixedStatisticNames: Set[String] = setOfStatisticAssignmentModels
+//          .flatMap(row =>
+//            Option(row.getAs[String]("fixedStatisticName"))
+//          ) // Ensure non-null values
+//          .toSet
+//        val variableStatisticNames: Set[String] = setOfStatisticAssignmentModels
+//          .flatMap(row =>
+//            Option(row.getAs[String]("variableStatisticName"))
+//          ) // Ensure non-null values
+//          .toSet
+//
+//        // Fetch fixed and variable statistics using the Map
+//        val fixedStatistics = getStatisticsFromMap(
+//          fixedStatisticNames,
+//          statisticModelMap,
+//          overheadCenterId
+//        )
+//        val variableStatistics = getStatisticsFromMap(
+//          variableStatisticNames,
+//          statisticModelMap,
+//          overheadCenterId
+//        )
+//
+//        // Create rows for both FIXED and VARIABLE cost types
+//        val fixedRow = (
+//          accountGroupId,
+//          overheadCenterId,
+//          "FIXED",
+//          fixedStatistics
+//        )
+//
+//        val variableRow = (
+//          accountGroupId,
+//          overheadCenterId,
+//          "VARIABLE",
+//          variableStatistics
+//        )
+//
+//        // Return a sequence of rows for flatMap to flatten
+//        Seq(fixedRow, variableRow)
+//      })
+//      .toDF("accountGroupId", "overheadCenterId", "costType", "statistics")
+//
+//    statisticsAssignmentDf.printSchema()
+//
+//    statisticsAssignmentDf
+  }
+
+  private def splitCostPerPeriod(
+      spark: SparkSession,
+      LOG: Logger,
+      periodicAccountDataInputDf: Dataset[Row],
+      costComponentsInputDf: Dataset[Row],
+      centerOrdersInputDf: Dataset[Row]
+  ): Dataset[Row] = {
+    import spark.implicits._
+    // Define constants used in the calculation
+    val PRECISION = 6
+    val ZERO = BigDecimal(0)
+    val HUNDRED = BigDecimal(100)
+    val PERIOD = BigDecimal(12)
+    val periodicAccountExpenseDataInputDf =
+      periodicAccountDataInputDf.filter(upper($"accountType") === "EXPENSE")
+    val periodicAccountNonExpenseDataInputDf =
+      periodicAccountDataInputDf
+        .filter(upper($"accountType") =!= "EXPENSE")
+        .withColumn("periodstr", col("period").cast("string"))
+
+    periodicAccountNonExpenseDataInputDf.show()
+
+    periodicAccountNonExpenseDataInputDf.foreach { row =>
+      val accountId = row.getAs[String]("accountId")
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"AccountType is not expense for account: $accountId in center: $centerId for period: $period. Hence split for expenses is not performed."
+      )
+    }
+
+    // Perform a left join based on centerId and accountId
+    val costComponentsMonthlyDf = costComponentsInputDf
+      .filter(col("usePeriodicData") === true)
+      .withColumnRenamed("centerId", "costCenterId")
+      .withColumnRenamed("accountId", "costAccountId")
+
+    val costComponentsAnnualDf = costComponentsInputDf
+      .filter(!col("usePeriodicData"))
+      .withColumnRenamed("centerId", "costCenterId")
+      .withColumnRenamed("accountId", "costAccountId")
+
+    val costComponentsModifiedDf = costComponentsInputDf
+      .withColumnRenamed("centerId", "costCenterId")
+      .withColumnRenamed("accountId", "costAccountId")
+
+    val centerOrdersModifiedInputDf = centerOrdersInputDf
+      .withColumnRenamed("centerId", "centerOrderCenterId")
+
+    centerOrdersModifiedInputDf.show()
+    val periodicAccountCostComponentsJoinedDf = periodicAccountDataInputDf
+      .join(
+        costComponentsModifiedDf,
+        (periodicAccountDataInputDf("centerId") === costComponentsModifiedDf(
+          "costCenterId"
+        )) &&
+          (periodicAccountDataInputDf("accountId") === costComponentsModifiedDf(
+            "costAccountId"
+          )),
+        "left"
+      )
+
+    // Perform the join using the renamed DataFrame
+    val periodicAccountExpenseMonthlyCostDF = periodicAccountExpenseDataInputDf
+      .join(
+        costComponentsMonthlyDf,
+        (periodicAccountExpenseDataInputDf(
+          "period"
+        ) === costComponentsMonthlyDf("periodicPercentageAmount.period")) &&
+          (periodicAccountExpenseDataInputDf(
+            "centerId"
+          ) === costComponentsMonthlyDf("costCenterId")) &&
+          (periodicAccountExpenseDataInputDf(
+            "accountId"
+          ) === costComponentsMonthlyDf("costAccountId")),
+        "inner"
+      )
+
+    val periodicAccountExpenseAnnualCostDF = periodicAccountExpenseDataInputDf
+      .join(
+        costComponentsAnnualDf,
+        (periodicAccountExpenseDataInputDf(
+          "centerId"
+        ) === costComponentsAnnualDf("costCenterId")) &&
+          (periodicAccountExpenseDataInputDf(
+            "accountId"
+          ) === costComponentsAnnualDf("costAccountId")),
+        "inner"
+      )
+
+    // Calculate fixedCost, variableCost, and other fields based on the logic
+    val splitCostByMonthDf = periodicAccountExpenseMonthlyCostDF
+      .withColumn(
+        "fixedCost",
+        when(
+          col("isUsePercent") === true,
+          (round(col("cost"), PRECISION) *
+            when(col("periodicPercentageAmount.percentage").isNull, ZERO)
+              .otherwise(
+                col("periodicPercentageAmount.percentage")
+              ) / HUNDRED)
+            .cast(
+              DoubleType
+            ) // fixedCost = cost * percentage / 100 with null handling
+        ).otherwise(
+          least(
+            round(col("cost"), PRECISION),
+            when(col("periodicPercentageAmount.amount").isNull, ZERO)
+              .otherwise(
+                round(col("periodicPercentageAmount.amount"), PRECISION)
+              )
+          ).cast(
+            DoubleType
+          ) // fixedCost = min(cost, amount)
+        )
+      )
+      .withColumn(
+        "variableCost",
+        (col("cost") - col("fixedCost")).cast(
+          DoubleType
+        ) // Calculate variableCost as cost - fixedCost
+      )
+      .withColumn(
+        "excluded",
+        lit(false)
+      )
+      .withColumn(
+        "status",
+        lit("SUCCESS")
+      )
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("expenseAccountGroupId").alias("accountGroupId"),
+        col("cost").alias("baseCost"),
+        col("fixedCost"),
+        col("variableCost"),
+        col("excluded"),
+        col("period"),
+        col("status")
+      )
+    splitCostByMonthDf.foreach { row =>
+      val accountId = row.getAs[String]("accountId")
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"Expense is split successfully using monthly data of account: $accountId in center: $centerId for period: $period"
+      )
+    }
+
+    // Calculate fixedCost, variableCost, and other fields based on the logic
+    val splitCostByAnnualDf = periodicAccountExpenseAnnualCostDF
+      .filter(
+        col("fixedBaseAmount") =!= 0 || (col("fixedBaseAmount") === 0 && (col(
+          "fixedPercent"
+        ) === 100 || col("fixedPercent") === 0))
+      )
+      .withColumn(
+        "fixedCost",
+        round(
+          (col("fixedBaseAmount").cast(DoubleType) * col(
+            "fixedPercent"
+          ).cast(DoubleType))
+            .divide(HUNDRED)
+            .divide(PERIOD),
+          PRECISION
+        ).cast(DoubleType)
+      )
+      .withColumn(
+        "fixedCost",
+        when(col("fixedCost").isNotNull, round(col("fixedCost"), PRECISION))
+          .otherwise(lit(0.0))
+      )
+      .withColumn(
+        "finalFixedCost",
+        when(
+          col("fixedPercent") === 100 || round(
+            col("fixedCost"),
+            PRECISION
+          ) > round(
+            col(
+              "cost"
+            ),
+            PRECISION
+          ),
+          round(col("cost"), PRECISION)
+        )
+          .otherwise(round(col("fixedCost"), PRECISION))
+      )
+      .withColumn(
+        "variableCost",
+        when(
+          round(col("fixedPercent"), PRECISION) === 0,
+          round(col("cost"), PRECISION)
+        )
+          .when(
+            round(col("fixedPercent"), PRECISION) === 100 || round(
+              col(
+                "fixedCost"
+              ),
+              PRECISION
+            ) > round(
+              col(
+                "cost"
+              ),
+              PRECISION
+            ),
+            lit(0.0)
+          )
+          .otherwise(
+            round(
+              round(col("cost"), PRECISION) - round(
+                col("fixedCost"),
+                PRECISION
+              ),
+              PRECISION
+            ).cast(DoubleType)
+          )
+      )
+      .withColumn(
+        "status",
+        lit("SUCCESS")
+      ) // Assuming StatusCode.SUCCESS translates to "SUCCESS"
+      .withColumn("excluded", lit(false))
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("expenseAccountGroupId").alias("accountGroupId"),
+        col("cost").alias("baseCost"),
+        col("finalFixedCost").alias("fixedCost"),
+        col("variableCost"),
+        col("excluded"),
+        col("period"),
+        col("status")
+      )
+
+    splitCostByAnnualDf.foreach { row =>
+      val accountId = row.getAs[String]("accountId")
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"Expense is split successfully using annual data of account: $accountId in center: $centerId for period: $period"
+      )
+    }
+
+    val splitCostBaseAmountZeroDf = periodicAccountExpenseAnnualCostDF
+      .filter(
+        (col("fixedPercent") > 0 && col("fixedPercent") < 100) && col(
+          "fixedBaseAmount"
+        ) === 0
+      )
+      .withColumn("fixedCost", round(lit(0.0), PRECISION))
+      .withColumn("variableCost", round(lit(0.0), PRECISION))
+      .withColumn(
+        "periodicAccountDataCost",
+        round(col("cost"), PRECISION).cast(DoubleType)
+      )
+      .withColumn(
+        "status",
+        lit("ANNUAL_FIXED_BASEAMOUNT_ZERO")
+      )
+      .withColumn(
+        "excluded",
+        lit(true)
+      )
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("expenseAccountGroupId").alias("accountGroupId"),
+        col("cost").alias("baseCost"),
+        col("fixedCost"),
+        col("variableCost"),
+        col("excluded"),
+        col("period"),
+        col("status")
+      )
+
+    splitCostBaseAmountZeroDf.foreach { row =>
+      val accountId = row.getAs[String]("accountId")
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"fixedBaseAmount for account: $accountId in center: $centerId for period: $period is zero"
+      )
+    }
+
+    val costComponentNullCenterIdCostDF = periodicAccountCostComponentsJoinedDf
+      .filter(col("costCenterId") === null)
+      .withColumn("fixedCost", round(lit(0.0), PRECISION))
+      .withColumn("variableCost", round(lit(0.0), PRECISION))
+      .withColumn(
+        "periodicAccountDataCost",
+        round(col("cost"), PRECISION).cast(DoubleType)
+      )
+      .withColumn(
+        "status",
+        lit("MISSING_CENTER_IN_COST_COMPONENT")
+      )
+      .withColumn(
+        "excluded",
+        lit(true)
+      )
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("expenseAccountGroupId").alias("accountGroupId"),
+        col("cost").alias("baseCost"),
+        col("fixedCost"),
+        col("variableCost"),
+        col("excluded"),
+        col("period"),
+        col("status")
+      )
+
+    costComponentNullCenterIdCostDF.foreach { row =>
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"Missing center: $centerId in costComponent for period: $period"
+      )
+    }
+
+    val costComponentNullAccountIdCostDF = periodicAccountCostComponentsJoinedDf
+      .filter(col("costAccountId") === null)
+      .withColumn("fixedCost", round(lit(0.0), PRECISION))
+      .withColumn("variableCost", round(lit(0.0), PRECISION))
+      .withColumn(
+        "periodicAccountDataCost",
+        round(col("cost"), PRECISION).cast(DoubleType)
+      )
+      .withColumn(
+        "status",
+        lit("MISSING_CENTER_ACCOUNT_IN_COST_COMPONENT")
+      )
+      .withColumn(
+        "excluded",
+        lit(true)
+      )
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("expenseAccountGroupId").alias("accountGroupId"),
+        col("cost").alias("baseCost"),
+        col("fixedCost"),
+        col("variableCost"),
+        col("excluded"),
+        col("period"),
+        col("status")
+      )
+
+    costComponentNullAccountIdCostDF.foreach { row =>
+      val accountId = row.getAs[String]("accountId")
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"Missing account: $accountId of center: $centerId in costComponent for period: $period"
+      )
+    }
+
+    val missingCenterIdInCenterOrdersDF = periodicAccountCostComponentsJoinedDf
+      .join(
+        centerOrdersModifiedInputDf,
+        col("centerId") === col("centerOrderCenterId"),
+        "left"
+      )
+      .filter(col("centerOrderCenterId") === null)
+      .withColumn("fixedCost", round(lit(0.0), PRECISION))
+      .withColumn("variableCost", round(lit(0.0), PRECISION))
+      .withColumn(
+        "periodicAccountDataCost",
+        round(col("cost"), PRECISION).cast(DoubleType)
+      )
+      .withColumn(
+        "status",
+        lit("MISSING_CENTER_IN_CENTER_ORDER")
+      )
+      .withColumn(
+        "excluded",
+        lit(true)
+      )
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("expenseAccountGroupId").alias("accountGroupId"),
+        col("cost").alias("baseCost"),
+        col("fixedCost"),
+        col("variableCost"),
+        col("excluded"),
+        col("period"),
+        col("status")
+      )
+
+    missingCenterIdInCenterOrdersDF.foreach { row =>
+      val centerId = row.getAs[String]("centerId")
+      val period = row.getAs[String]("periodstr")
+
+      // Perform the logging
+      LOG.debug(
+        s"Missing center: $centerId in centerOrder for period: $period"
+      )
+    }
+
+    missingCenterIdInCenterOrdersDF.show()
+    // Show the result
+    val splitCostDf = splitCostByAnnualDf
+      .union(splitCostByMonthDf)
+      .union(splitCostBaseAmountZeroDf)
+      .union(costComponentNullCenterIdCostDF)
+      .union(costComponentNullAccountIdCostDF)
+      .union(missingCenterIdInCenterOrdersDF)
+
+    splitCostDf
+  }
+
+  private def validatePeriodicAccountDataDf(inputDf: Dataset[Row]): Unit = {
+
+    // Validate centerId is not null or empty
+    val centerIdValidationDf = inputDf.filter(
+      col("centerId").isNull || trim(col("centerId")) === ""
+    )
+    if (centerIdValidationDf.count() > 0) {
+      throw new IllegalArgumentException("centerId can't be null or empty")
+    }
+
+    // Validate accountId is not null or empty
+    val accountIdValidationDf = inputDf.filter(
+      col("accountId").isNull || trim(col("accountId")) === ""
+    )
+    if (accountIdValidationDf.count() > 0) {
+      throw new IllegalArgumentException(
+        s"accountId can't be null or empty for centerId: ${accountIdValidationDf.select("centerId").head.getString(0)}"
+      )
+    }
+
+    // Validate `accountType` is not null
+    val accountTypeValidationDf = inputDf.filter(col("accountType").isNull)
+    if (accountTypeValidationDf.count() > 0) {
+      val centerId =
+        accountTypeValidationDf.select("centerId").head.getString(0)
+      val accountId =
+        accountTypeValidationDf.select("accountId").head.getString(0)
+      throw new IllegalArgumentException(
+        s"accountType can't be null for centerId: $centerId, accountId: $accountId"
+      )
+    }
+
+    // Validate `periodicData`: Check if keys are between 1 and 12, and values are not null
+    inputDf.select(col("periodicData")).collect().foreach { row =>
+      // Get the map and convert keys from String to Int
+      val periodicData =
+        row.getAs[Map[String, String]]("periodicData").map {
+          case (key, value) =>
+            key.toInt -> BigDecimal(value)
+        }
+
+      periodicData.foreach { case (period, value) =>
+        if (period < 1 || period > 12) {
+          val centerId = row.getAs[String]("centerId")
+          val accountId = row.getAs[String]("accountId")
+          throw new IllegalArgumentException(
+            s"incorrect period value. period value should be between 1 and 12 for centerId: $centerId, accountId: $accountId, period: $period"
+          )
+        }
+
+        if (value == null) {
+          val centerId = row.getAs[String]("centerId")
+          val accountId = row.getAs[String]("accountId")
+          throw new IllegalArgumentException(
+            s"cost can't be null for centerId: $centerId, accountId: $accountId, period: $period"
+          )
+        }
+      }
+    }
+  }
+
+  //TODO : exception messages needs to be made clearer in validateCostComponentModelDf
+  private def validateCostComponentModelDf(inputDf: Dataset[Row]): Unit = {
+    // Define a UDF to validate fixedPercent and fixedBaseAmount
+    val validateFixedValues: UserDefinedFunction = udf(
+      (
+          usePeriodicData: Boolean,
+          fixedPercent: java.math.BigDecimal,
+          fixedBaseAmount: java.math.BigDecimal
+      ) => {
+        if (!usePeriodicData) {
+          if (fixedPercent == null || fixedBaseAmount == null) {
+            "fixedPercent or fixedBaseAmount can't be null when usePeriodicData is false"
+          } else if (
+            fixedPercent
+              .compareTo(java.math.BigDecimal.ZERO) < 0 || fixedPercent
+              .compareTo(java.math.BigDecimal.valueOf(100)) > 0
+          ) {
+            "fixedPercent is either negative or greater than 100"
+          } else {
+            null
+          }
+        } else {
+          null
+        }
+      }
+    )
+
+    // Define a UDF to validate percentageAmountByPeriod
+    val validatePercentageAmountByPeriod: UserDefinedFunction = udf(
+      (
+          usePeriodicData: Boolean,
+          percentageAmountByPeriod: Map[String, String]
+      ) => {
+        if (usePeriodicData) {
+          if (
+            percentageAmountByPeriod == null || percentageAmountByPeriod.isEmpty
+          ) {
+            "percentageAmountByPeriod is either null or empty"
+          } else {
+            val errorMessages = percentageAmountByPeriod.flatMap {
+              case (period, value) =>
+                try {
+                  val periodInt = period.toInt
+                  val periodicPercentageAmount = BigDecimal(value)
+                  if (periodInt < 1 || periodInt > 12) {
+                    Some(
+                      s"key period in percentageAmountByPeriod map is incorrect"
+                    )
+                  } else if (
+                    periodicPercentageAmount < BigDecimal(
+                      -100
+                    ) || periodicPercentageAmount > BigDecimal(100)
+                  ) {
+                    Some(
+                      s"percentage can't be less than -100 or greater than 100"
+                    )
+                  } else {
+                    None
+                  }
+                } catch {
+                  case _: NumberFormatException =>
+                    Some("period key or value is not a valid number")
+                }
+            }
+            if (errorMessages.nonEmpty) errorMessages.mkString(", ") else null
+          }
+        } else {
+          null
+        }
+      }
+    )
+
+    // Validate centerId is not null or empty
+    val centerIdValidationDf = inputDf.filter(
+      col("centerId").isNull || trim(col("centerId")) === ""
+    )
+    if (centerIdValidationDf.count() > 0) {
+      throw new IllegalArgumentException("centerId can't be null or empty")
+    }
+
+    // Validate accountId is not null or empty
+    val accountIdValidationDf = inputDf.filter(
+      col("accountId").isNull || trim(col("accountId")) === ""
+    )
+    if (accountIdValidationDf.count() > 0) {
+      throw new IllegalArgumentException(
+        s"accountId can't be null or empty for centerId: ${accountIdValidationDf.select("centerId").head.getString(0)}"
+      )
+    }
+
+    // Validate expenseAccountGroupId is not null or empty
+    val expenseAccountGroupIdValidationDf = inputDf.filter(
+      col("expenseAccountGroupId").isNull || trim(
+        col("expenseAccountGroupId")
+      ) === ""
+    )
+    if (expenseAccountGroupIdValidationDf.count() > 0) {
+      throw new IllegalArgumentException(
+        s"expenseAccountGroupId can't be null or empty for centerId: " +
+          s"${expenseAccountGroupIdValidationDf.select("centerId").head.getString(0)}" +
+          " and for accountId: " + s"${expenseAccountGroupIdValidationDf.select("accountId").head.getString(0)}"
+      )
+    }
+
+    // Apply UDFs for fixedPercent, fixedBaseAmount, and percentageAmountByPeriod validation
+    val validationDf = inputDf
+      .withColumn(
+        "fixedValueError",
+        validateFixedValues(
+          col("usePeriodicData"),
+          col("fixedPercent"),
+          col("fixedBaseAmount")
+        )
+      )
+      .withColumn(
+        "percentageAmountError",
+        validatePercentageAmountByPeriod(
+          col("usePeriodicData"),
+          col("percentageAmountByPeriod")
+        )
+      )
+
+    // Collect rows with validation errors
+    val errors = validationDf
+      .filter(
+        col("fixedValueError").isNotNull || col(
+          "percentageAmountError"
+        ).isNotNull
+      )
+      .select(
+        col("centerId"),
+        col("accountId"),
+        col("fixedValueError"),
+        col("percentageAmountError")
+      )
+      .collect()
+
+    // Throw an exception with detailed error messages
+    if (errors.nonEmpty) {
+      val errorMessages = errors
+        .map { row =>
+          val centerId = row.getAs[String]("centerId")
+          val accountId = row.getAs[String]("accountId")
+          val fixedError = row.getAs[String]("fixedValueError")
+          val percentageError = row.getAs[String]("percentageAmountError")
+          s"Validation failed for centerId: $centerId, accountId: $accountId. Errors: ${Option(fixedError)
+            .getOrElse("")} ${Option(percentageError).getOrElse("")}".trim
+        }
+        .mkString("\n")
+      throw new IllegalArgumentException(s"Validation errors:\n$errorMessages")
+    }
+  }
+
+  private def validateCenterOrderModelDf(inputDf: Dataset[Row]): Unit = {
+
+    // Validate centerId is not null or empty
+    val centerIdValidationDf = inputDf.filter(
+      col("centerId").isNull || trim(col("centerId")) === ""
+    )
+    if (centerIdValidationDf.count() > 0) {
+      throw new IllegalArgumentException("centerId can't be null or empty")
+    }
+
+    // Validate centerType is not null or empty
+    val centerTypeValidationDf = inputDf.filter(
+      col("centerType").isNull
+    )
+    if (centerTypeValidationDf.count() > 0) {
+      throw new IllegalArgumentException("centerType can't be null")
+    }
+
+    // Validate centerType is not null or empty
+    val sequenceNumberValidationDf = inputDf.filter(
+      col("sequenceNumber") < 1
+    )
+    if (sequenceNumberValidationDf.count() > 0) {
+      throw new IllegalArgumentException("sequenceOrder can't be less than one")
+    }
+  }
+
+  //TODO : exception messages needs to be made clearer in validateTransfersModelDf
+  private def validateTransfersModelDf(inputDf: Dataset[Row]): Unit = {
+
+    // Validate sourceCenterId
+    val sourceCenterIdNullOrEmptyDf = inputDf.filter(
+      col("sourceCenterId").isNull || trim(col("sourceCenterId")) === ""
+    )
+    if (sourceCenterIdNullOrEmptyDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "sourceCenterId can't be null or empty"
+      )
+    }
+
+    // Validate destinationCenterId
+    val destinationCenterIdNullOrEmptyDf = inputDf.filter(
+      col("destinationCenterId").isNull || trim(
+        col("destinationCenterId")
+      ) === ""
+    )
+    if (destinationCenterIdNullOrEmptyDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "destinationCenterId can't be null or empty"
+      )
+    }
+
+    // Validate costType
+    val costTypeNullDf = inputDf.filter(col("costType").isNull)
+    if (costTypeNullDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "costType cannot be null for sourceCenterId and destinationCenterId"
+      )
+    }
+
+    // Validate transferLevel
+    val transferLevelNullDf = inputDf.filter(col("transferLevel").isNull)
+    if (transferLevelNullDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "transferLevel cannot be null for sourceCenterId and destinationCenterId"
+      )
+    }
+
+    // Validate transferType
+    val transferTypeNullDf = inputDf.filter(col("transferType").isNull)
+    if (transferTypeNullDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "transferType cannot be null for sourceCenterId and destinationCenterId"
+      )
+    }
+
+    // When transferLevel is Center, sourceCenterId and destinationCenterId can't be the same
+    val sameCenterIdDf = inputDf.filter(
+      col("transferLevel") === "CENTER" && col("sourceCenterId") === col(
+        "destinationCenterId"
+      )
+    )
+    if (sameCenterIdDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "sourceCenterId and destinationCenterId can't be the same when transfer level is center"
+      )
+    }
+
+    // When transferLevel is Account, sourceAccountId and destinationAccountId cannot be null or empty
+    val accountNullDf = inputDf.filter(
+      col("transferLevel") === "ACCOUNT" &&
+        (col("sourceAccountId").isNull || trim(col("sourceAccountId")) === "" ||
+          col("destinationAccountId").isNull || trim(
+            col("destinationAccountId")
+          ) === "")
+    )
+    if (accountNullDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "sourceAccountId or destinationAccountId can't be null or empty when transfer level is account"
+      )
+    }
+
+    // When sourceCenterId and destinationCenterId are the same, sourceAccountId and destinationAccountId cannot be the same
+    val sameAccountIdDf = inputDf.filter(
+      col("transferLevel") === "ACCOUNT" &&
+        col("sourceCenterId") === col("destinationCenterId") &&
+        col("sourceAccountId") === col("destinationAccountId")
+    )
+    if (sameAccountIdDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "sourceAccountId and destinationAccountId can't be the same when sourceCenterId and destinationCenterId are the same"
+      )
+    }
+
+    // When transferType is OFFSET, costType cannot be variable and transferLevel cannot be center
+    val offsetTransferDf = inputDf.filter(
+      col("transferType") === "OFFSET" &&
+        (col("costType") === "VARIABLE" || col("transferLevel") === "CENTER")
+    )
+    if (offsetTransferDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "costType cannot be variable or transferLevel cannot be center when transferType is offset"
+      )
+    }
+
+    // Validate percentageAmountByPeriod is not null or empty
+    val percentageAmountEmptyDf = inputDf.filter(
+      col("percentageAmountByPeriod").isNull || size(
+        col("percentageAmountByPeriod")
+      ) === 0
+    )
+    if (percentageAmountEmptyDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "percentageAmountByPeriod is either null or empty"
+      )
+    }
+
+    // Explode the map for validation
+    val explodedDf = inputDf
+      .withColumn("period", explode(map_keys(col("percentageAmountByPeriod"))))
+      .withColumn(
+        "percentageAmountByPeriod",
+        explode(map_values(col("percentageAmountByPeriod")))
+      )
+
+    // Validate period is between 1 and 12
+    val invalidPeriodDf = explodedDf.filter(
+      col("period").isNull || col("period") > 12 || col("period") < 1
+    )
+    if (invalidPeriodDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "period in percentageAmountByPeriod map is incorrect for sourceCenterId and destinationCenterId"
+      )
+    }
+
+    // Validate percentageAmountByPeriod cannot be null and its range based on isUsePercent
+    val isUsePercentCol =
+      inputDf.select(col("isUsePercent")).first.getBoolean(0)
+
+    val percentageAmountNullDf =
+      explodedDf.filter(col("percentageAmountByPeriod").isNull)
+    if (percentageAmountNullDf.count() > 0) {
+      if (isUsePercentCol) {
+        throw new IllegalArgumentException(
+          "percentage can't be null when usePercent is true"
+        )
+      } else {
+        throw new IllegalArgumentException(
+          "amount can't be null when usePercent is false"
+        )
+      }
+    }
+
+    // Validate if isUsePercent is true, percentageAmountByPeriod must be between -100 and 100
+    if (isUsePercentCol) {
+      val invalidPercentageDf = explodedDf.filter(
+        col("percentageAmountByPeriod") < -100 || col(
+          "percentageAmountByPeriod"
+        ) > 100
+      )
+      if (invalidPercentageDf.count() > 0) {
+        throw new IllegalArgumentException(
+          "percentage can't be less than -100 or greater than 100"
+        )
+      }
+    }
+  }
+
+  // Helper function to build the percentage amount based on `isUsePercent` flag
+  def buildPeriodicPercentageAmountByPeriod(
+      percentageAmountByPeriod: Map[String, String],
+      isUsePercent: Boolean
+  ): Seq[(Int, Double, Double)] = {
+    if (percentageAmountByPeriod == null || percentageAmountByPeriod.isEmpty) {
+      Seq.empty[(Int, Double, Double)]
+    } else {
+      percentageAmountByPeriod.map { case (periodStr, valueStr) =>
+        val period = periodStr.toInt
+        val value = BigDecimal(valueStr)
+        if (isUsePercent) {
+          (period, 0.0, value.toDouble) // amount = 0.0, percentage = value
+        } else {
+          (period, value.toDouble, 0.0) // amount = value, percentage = 0.0
+        }
+      }.toSeq
+    }
+  }
+  private def validateStatisticModelDf(statisticModel: Dataset[Row]): Unit = {
+
+    // Validate statisticName
+    val statisticNameNullOrEmptyDf = statisticModel.filter(
+      col("statisticName").isNull || trim(col("statisticName")) === ""
+    )
+    if (statisticNameNullOrEmptyDf.count() > 0) {
+      throw new IllegalArgumentException("statisticName can't be null or empty")
+    }
+
+    // Validate centerId
+    val centerIdNullOrEmptyDf = statisticModel.filter(
+      col("centerId").isNull || trim(col("centerId")) === ""
+    )
+    if (centerIdNullOrEmptyDf.count() > 0) {
+      throw new IllegalArgumentException("centerId can't be null or empty")
+    }
+
+    // Validate statisticValueByPeriod is not null or empty
+    val statisticValueByPeriodNullOrEmptyDf = statisticModel.filter(
+      col("statisticValueByPeriod").isNull || size(
+        col("statisticValueByPeriod")
+      ) === 0
+    )
+    if (statisticValueByPeriodNullOrEmptyDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "statisticValueByPeriod can't be null or empty"
+      )
+    }
+
+    // Explode the map column for validation
+    val explodedDf = statisticModel
+      .withColumn("period", explode(map_keys(col("statisticValueByPeriod"))))
+      .withColumn(
+        "statisticValue",
+        explode(map_values(col("statisticValueByPeriod")))
+      )
+
+    // Validate that period is between 1 and 12
+    val invalidPeriodDf = explodedDf.filter(
+      col("period").isNull || col("period") < 1 || col("period") > 12
+    )
+    if (invalidPeriodDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "key period in statisticValueByPeriod map is incorrect for the given statisticId and centerId"
+      )
+    }
+
+    // Validate that statisticValue is not null
+    val statisticValueNullDf = explodedDf.filter(col("statisticValue").isNull)
+    if (statisticValueNullDf.count() > 0) {
+      throw new IllegalArgumentException(
+        "statisticValue can't be null for the given statisticId and centerId"
+      )
+    }
+  }
+//  def getStatisticsFromMap(
+//      statisticNames: Set[String],
+//      statisticModelMap: Map[(String, String), Map[Int, Double]],
+//      overheadCenterId: String
+//  ): Seq[(String, String, String)] = { //}, Map[Int, Double])] = {
+//
+//    statisticModelMap.collect {
+//      case ((name, centerId), periodValueMap)
+//          if statisticNames.contains(name) && centerId != overheadCenterId =>
+//        (name, name, centerId) //, periodValueMap)
+//    }.toSeq
+//  }
+//// Define the schema for StatisticValueByPeriod with period as IntegerType
+//  val statisticValueByPeriodSchema = StructType(
+//    Seq(
+//      StructField("period", IntegerType, nullable = true),
+//      StructField("statisticValue", DoubleType, nullable = true)
+//    )
+//  )
+//
+//  // Define the schema for Statistics
+//  val statisticsSchema = StructType(
+//    Seq(
+//      StructField("statisticId", StringType, nullable = true),
+//      StructField("statisticName", StringType, nullable = true),
+//      StructField("centerId", StringType, nullable = true),
+//      StructField(
+//        "statisticValueByPeriod",
+//        MapType(IntegerType, DoubleType, valueContainsNull = false),
+//        nullable = true
+//      )
+//    )
+//  )
+//
+//  // Define the complete schema for the DataFrame
+//  val finalSchema = StructType(
+//    Seq(
+//      StructField("accountGroupId", StringType, nullable = true),
+//      StructField("overheadCenterId", StringType, nullable = true),
+//      StructField("costType", StringType, nullable = true),
+//      StructField("statistics", statisticsSchema, nullable = true)
+//    )
+//  )
+}
+
